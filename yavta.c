@@ -38,6 +38,10 @@
 #include <sys/time.h>
 
 #include <linux/videodev2.h>
+#include <magick/ImageMagick.h>
+#include <ImageMagick-6/magick/geometry.h>
+#include <ImageMagick-6/magick/image.h>
+#include <dirent.h>
 
 #include "interface/mmal/mmal.h"
 #include "interface/mmal/mmal_buffer.h"
@@ -52,9 +56,25 @@
 #endif
 
 #define ARRAY_SIZE(a)	(sizeof(a)/sizeof((a)[0]))
+#define MODE_CROP 0
+#define MODE_MASK 1
 
 int debug = 1;
+int debug_logo = 0;
+
 #define print(...) do { if (debug) printf(__VA_ARGS__); }  while (0)
+#define print_logo(...) do { if (debug_logo) printf(__VA_ARGS__); }  while (0)
+
+struct mylogos
+{
+	char name[20];
+	char fileName[100];
+	Image *img;
+	RectangleInfo rect;
+	RectangleInfo rectCrop;
+	size_t mode;
+	bool isLogo;
+};
 
 enum buffer_fill_mode
 {
@@ -119,11 +139,16 @@ struct device
 	bool write_data_prefix;
 
 
-	VCOS_THREAD_T save_thread;
+	VCOS_THREAD_T processlogo_thread;
 	MMAL_QUEUE_T *save_queue;
 	int thread_quit;
-	FILE *h264_fd;
-	FILE *pts_fd;
+	FILE *jpeg_fd;
+	
+	const char *save_filename;
+	const char *pngview_path;
+	const char *logos_path;
+	
+	int save_encode;
 };
 
 static void errno_exit(const char *s)
@@ -1748,41 +1773,219 @@ static void isp_ip_cb(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 	}
 }
 
-static void * save_thread(void *arg)
+static int parse_ext(const struct dirent *dir)
+{
+	if(!dir)
+		return 0;
+	
+	if(dir->d_type == DT_REG) { /* only deal with regular file */
+		const char *ext = strrchr(dir->d_name,'.');
+		if((!ext) || (ext == dir->d_name))
+			return 0;
+		else {
+			if(strcmp(ext, ".jpg") == 0)
+			return 1;
+		}
+	}
+  return 0;
+}
+
+void crop_image (RectangleInfo *rect, struct device *dev)
+{
+	print_logo("crop %d %d %d %d\n", rect->width, rect->height, rect->x, rect->y);
+	MMAL_PARAMETER_CROP_T crop = {{MMAL_PARAMETER_CROP, sizeof(MMAL_PARAMETER_CROP_T)}, {0,0,0,0}};
+	crop.rect.x = rect->x;
+	crop.rect.y = rect->y;
+	crop.rect.width  = rect->width;
+	crop.rect.height = rect->height;
+	mmal_port_parameter_set(dev->render->input[0], &crop.hdr);
+}
+
+void mask_image (struct mylogos *logo, int on, struct device *dev)
+{
+  char* fileName = malloc(strlen(logo->fileName)+2);	
+	sscanf(logo->fileName,"%[^.].jpg", fileName);
+	strcat(fileName,".png &");	
+	 
+	char *pngview_line = "/pngview -b 0 -l 3 -x 0 -y 0 ";
+	char *pngview_launcher = malloc(strlen(dev->pngview_path)+strlen(pngview_line)+strlen(dev->logos_path)+1+strlen(fileName));
+	sprintf(pngview_launcher, "%s%s%s/%s", dev->pngview_path, pngview_line, dev->logos_path, fileName);
+	
+	if (on)
+		system(pngview_launcher);
+	else
+		system("killall pngview");
+	
+	free(fileName);
+	free(pngview_launcher);
+}
+
+Image *get_logo(struct mylogos *logo, struct MMAL_BUFFER_HEADER_T *live, struct device *dev)
+{
+	ExceptionInfo e;
+	GetExceptionInfo(&e);
+	ImageInfo *info = CloneImageInfo(NULL);
+	Image *img;
+	char *f = malloc(strlen(dev->logos_path)+1+strlen(logo->fileName));
+	sprintf(f, "%s/%s", dev->logos_path, logo->fileName);
+	
+	if (live)
+	{			
+		img = BlobToImage(info, live->data, live->length, &e);
+	}
+	else
+	{
+		strcpy(info->filename, f);
+		img = ReadImage(info, &e);
+	}
+	CatchException(&e);
+	free(f);
+	
+	Image *imgCrop = CropImage(img, &logo->rect, &e);	
+	CatchException(&e);
+	
+	DestroyImageInfo(info);
+	DestroyExceptionInfo(&e);
+	DestroyImage(img);
+	
+	return imgCrop;
+}
+
+bool do_psnr (Image *logoLive, struct mylogos *logo, struct device *dev)
+{	
+	RectangleInfo resetCrop;
+	double psnr;
+	bool isLogo;
+	
+	ExceptionInfo e;
+	GetExceptionInfo(&e);
+	GetImageDistortion(logoLive, logo->img, PeakSignalToNoiseRatioMetric, &psnr, &e);
+	CatchException(&e);
+	DestroyExceptionInfo(&e);
+
+	print_logo("psnr %lf\n", psnr);
+	
+	if (psnr > 19)
+	{	
+		// effetta la modifica solo la prima volta che trova corrispondenza con il logo
+		if (!logo->isLogo)
+		{
+			print_logo("mod %d\n", logo->mode);
+			if (logo->mode == MODE_CROP)
+				crop_image(&logo->rectCrop, dev);
+			else
+				mask_image(logo, 1, dev);
+		}
+				
+		isLogo = true;
+	}
+	else
+	{
+		// effetta la modifica solo la prima volta che NON trova corrispondenza con il logo
+		if (logo->isLogo)
+		{	
+			print_logo("unmod %d\n", logo->mode);
+			if (logo->mode == MODE_CROP)
+			{
+				resetCrop.x = 0;
+				resetCrop.y = 0;
+				resetCrop.width = 1920;
+				resetCrop.height = 1080;
+				crop_image(&resetCrop, dev);
+			}
+			else
+				mask_image(logo,0, dev);
+		}
+
+		isLogo = false;
+	}					
+					
+	return isLogo;
+}
+
+void *processlogo_thread( void *arg )
 {
 	struct device *dev = (struct device *)arg;
+	struct dirent **files;
+  int totLogos;
+	int currentLogo = 0;
+	char s[10];
 	MMAL_BUFFER_HEADER_T *buffer;
 	MMAL_STATUS_T status;
 	unsigned int bytes_written;
+	
+	// looking for logos
+  totLogos = scandir(dev->logos_path, &files, parse_ext, alphasort);
+  if (totLogos < 0) {
+		perror("scandir");
+		return NULL;
+	}	
 
-	while (!dev->thread_quit)
-	{
-		//Being lazy and using a timed wait instead of setting up a
-		//mechanism for skipping this when destroying the thread
-		buffer = mmal_queue_timedwait(dev->save_queue, 500);
+	// init channels logo
+	struct mylogos logos[totLogos];
+	for (int i=0;i<totLogos;i++) {
+		sscanf(files[i]->d_name,"%[^_]_w%d_h%d_x%d_y%d_m%[^_]_cw%d_ch%d_cx%d_cy%d", 
+						logos[i].name, &logos[i].rect.width, &logos[i].rect.height, &logos[i].rect.x, &logos[i].rect.y,
+						s, &logos[i].rectCrop.width, &logos[i].rectCrop.height, &logos[i].rectCrop.x, &logos[i].rectCrop.y);
+		
+		if (strcmp (s,"CROP") == 0) 
+			logos[i].mode = MODE_CROP; 
+		else 
+			logos[i].mode = MODE_MASK;
+
+		print("Found Channel: %s rect:(x=%d y=%d width=%d height=%d) mode:(%s) rectCrop:(x=%d y=%d width=%d height=%d)\n",
+						logos[i].name, logos[i].rect.x, logos[i].rect.y, logos[i].rect.width, logos[i].rect.height,
+						(logos[i].mode == MODE_CROP) ? "CROP" : "MASK", 
+						logos[i].rectCrop.x, logos[i].rectCrop.y, logos[i].rectCrop.width, logos[i].rectCrop.height);
+		
+		strcpy(logos[i].fileName,files[i]->d_name);
+		logos[i].isLogo = false;	
+		free(files[i]);
+	}
+	free(files);
+
+	// add cropped image (after the first loop for debug log)
+	for (int i=0;i<totLogos;i++)
+		logos[i].img = get_logo(&logos[i], NULL, dev);		
+	
+	while (!dev->thread_quit) {
+		buffer = mmal_queue_get(dev->save_queue);
+		//buffer = mmal_queue_timedwait(dev->save_queue, 500);
 		if (!buffer)
-			continue;
-
-		//print("Buffer %p saving, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
-		if (dev->h264_fd)
 		{
-			bytes_written = fwrite(buffer->data, 1, buffer->length, dev->h264_fd);
-			fflush(dev->h264_fd);
-
+			usleep(1000);
+			continue;
+		}
+		//print("Buffer %p saving, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
+	
+		if (sizeof(logos)>0)
+		{	
+			print_logo("processing %s (%d//%d)\n", logos[currentLogo].name, currentLogo+1, totLogos);
+			Image *logoLive = get_logo(&logos[currentLogo], buffer, dev);		
+			logos[currentLogo].isLogo = do_psnr(logoLive, &logos[currentLogo], dev);
+			
+			// free
+			DestroyImage(logoLive);
+		}
+		
+		// compare only one logo for cycle
+		currentLogo++;
+		if (currentLogo > totLogos-1)
+			currentLogo = 0;
+		
+		if (dev->save_encode)
+		{	
+			dev->jpeg_fd = fopen(dev->save_filename, "wb");
+			bytes_written = fwrite(buffer->data, 1, buffer->length, dev->jpeg_fd);
+			fflush(dev->jpeg_fd);
+			pclose(dev->jpeg_fd);
+			
 			if (bytes_written != buffer->length)
 			{
 				print("Failed to write buffer data (%d from %d)- aborting", bytes_written, buffer->length);
 			}
 		}
-		else
-		{
-			print("No file to save to\n");
-		}
-		if (dev->pts_fd &&
-		    !(buffer->flags & MMAL_BUFFER_HEADER_FLAG_CONFIG) &&
-		    buffer->pts != MMAL_TIME_UNKNOWN)
-			fprintf(dev->pts_fd, "%lld.%03lld\n", buffer->pts/1000, buffer->pts%1000);
-
+		
 		buffer->length = 0;
 		status = mmal_port_send_buffer(dev->encoder->output[0], buffer);
 		if(status != MMAL_SUCCESS)
@@ -1790,6 +1993,11 @@ static void * save_thread(void *arg)
 			print("mmal_port_send_buffer failed on buffer %p, status %d", buffer, status);
 		}
 	}
+	
+	// free cropped logos
+	for (int i=0;i<totLogos;i++)
+		DestroyImage(logos[i].img);
+	
 	return NULL;
 }
 
@@ -1820,6 +2028,7 @@ static void isp_output_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 {
 	//print("Buffer %p from isp, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
 	//vcos_log_error("File handle: %p", port->userdata);
+	static int framecount = 0;
 	struct device *dev = (struct device*)port->userdata;
 
 	if (dev->render)
@@ -1831,7 +2040,7 @@ static void isp_output_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 			mmal_port_send_buffer(dev->render->input[0], out);
 		}
 	}
-	if (dev->encoder)
+	if (dev->encoder && ((framecount%50) == 0))
 	{
 		MMAL_BUFFER_HEADER_T *out = mmal_queue_get(dev->encode_pool->queue);
 		if (out)
@@ -1840,6 +2049,7 @@ static void isp_output_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 			mmal_port_send_buffer(dev->encoder->input[0], out);
 		}
 	}
+	framecount++;
 	mmal_buffer_header_release(buffer);
 
 	buffers_to_isp(dev);
@@ -1946,7 +2156,7 @@ static void handle_event(struct device *dev)
         }
 }
 
-static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *filename)
+static int setup_mmal(struct device *dev, int nbufs, int do_encode)
 {
 	MMAL_STATUS_T status;
 	VCOS_STATUS_T vcos_status;
@@ -1967,7 +2177,7 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 
 	if (do_encode)
 	{
-		status = mmal_component_create("vc.ril.video_encode", &dev->encoder);
+		status = mmal_component_create("vc.ril.image_encode", &dev->encoder);
 		if(status != MMAL_SUCCESS)
 		{
 			print("Failed to create encoder");
@@ -2056,6 +2266,7 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 		port->format->es->video.crop.height >>= 1;
 	}
 	port->buffer_num = 3;
+	port->format->es->video.height = (port->format->es->video.crop.height+15) & ~15;
 
 	status = mmal_port_format_commit(port);
 	if (status != MMAL_SUCCESS)
@@ -2082,24 +2293,18 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 		if (status == MMAL_SUCCESS)
 			status = mmal_port_format_commit(encoder_input);
 
-		// Only supporting H264 at the moment
-		encoder_output->format->encoding = MMAL_ENCODING_H264;
+		// Only supporting JPEG at the moment
+		encoder_output->format->encoding = MMAL_ENCODING_JPEG;
 
-		encoder_output->format->bitrate = 10000000;
-		encoder_output->buffer_size = 256<<10;//encoder_output->buffer_size_recommended;
+		encoder_output->buffer_size = encoder_output->buffer_size_recommended;
 
 		if (encoder_output->buffer_size < encoder_output->buffer_size_min)
-			encoder_output->buffer_size = encoder_output->buffer_size_min;
+			 encoder_output->buffer_size = encoder_output->buffer_size_min;
 
-		encoder_output->buffer_num = 8; //encoder_output->buffer_num_recommended;
-
+		encoder_output->buffer_num = encoder_output->buffer_num_recommended;
+		
 		if (encoder_output->buffer_num < encoder_output->buffer_num_min)
-			encoder_output->buffer_num = encoder_output->buffer_num_min;
-
-		// We need to set the frame rate on output to 0, to ensure it gets
-		// updated correctly from the input framerate when port connected
-		encoder_output->format->es->video.frame_rate.num = 0;
-		encoder_output->format->es->video.frame_rate.den = 1;
+			 encoder_output->buffer_num = encoder_output->buffer_num_min;
 
 		// Commit the port changes to the output port
 		status = mmal_port_format_commit(encoder_output);
@@ -2109,44 +2314,12 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 			print("Unable to set format on encoder output port\n");
 		}
 
-		{
-			MMAL_PARAMETER_VIDEO_PROFILE_T  param;
-			param.hdr.id = MMAL_PARAMETER_PROFILE;
-			param.hdr.size = sizeof(param);
-
-			param.profile[0].profile = MMAL_VIDEO_PROFILE_H264_HIGH;//state->profile;
-			param.profile[0].level = MMAL_VIDEO_LEVEL_H264_4;
-
-			status = mmal_port_parameter_set(encoder_output, &param.hdr);
-			if (status != MMAL_SUCCESS)
-			{
-				print("Unable to set H264 profile\n");
-			}
-		}
-
-		if (mmal_port_parameter_set_boolean(encoder_input, MMAL_PARAMETER_VIDEO_IMMUTABLE_INPUT, 1) != MMAL_SUCCESS)
-		{
-			print("Unable to set immutable input flag\n");
-			// Continue rather than abort..
-		}
-
-		//set INLINE HEADER flag to generate SPS and PPS for every IDR if requested
-		if (mmal_port_parameter_set_boolean(encoder_output, MMAL_PARAMETER_VIDEO_ENCODE_INLINE_HEADER, 0) != MMAL_SUCCESS)
-		{
-			print("failed to set INLINE HEADER FLAG parameters\n");
-			// Continue rather than abort..
-		}
-
-		//set INLINE VECTORS flag to request motion vector estimates
-		if (mmal_port_parameter_set_boolean(encoder_output, MMAL_PARAMETER_VIDEO_ENCODE_INLINE_VECTORS, 0) != MMAL_SUCCESS)
-		{
-			print("failed to set INLINE VECTORS parameters\n");
-			// Continue rather than abort..
-		}
+		// Set the JPEG quality level
+		status = mmal_port_parameter_set_uint32(encoder_output, MMAL_PARAMETER_JPEG_Q_FACTOR, 30);
 
 		if (status != MMAL_SUCCESS)
 		{
-			print("Unable to set format on video encoder input port\n");
+			print("Unable to set JPEG quality\n");
 		}
 
 		print("Enable encoder....\n");
@@ -2222,23 +2395,9 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 
 	buffers_to_isp(dev);
 
-	// open h264 file and put the file handle in userdata for the encoder output port
+	// open JPEG file and put the file handle in userdata for the encoder output port
 	if (dev->encoder)
 	{
-		if (filename[0] == '-' && filename[1] == '\0')
-		{
-			dev->h264_fd = stdout;
-			debug = 0;
-		}
-		else {
-			printf("Writing data to %s\n", filename);
-			dev->h264_fd = fopen(filename, "wb");
-		}
-
-		dev->pts_fd = (void*)fopen("file.pts", "wb");
-		if (dev->pts_fd) /* save header for mkvmerge */
-			fprintf(dev->pts_fd, "# timecode format v2\n");
-
 		encoder_output->userdata = (void*)dev;
 
 		//Create encoder output buffers
@@ -2258,8 +2417,8 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 			return -1;
 		}
 
-		vcos_status = vcos_thread_create(&dev->save_thread, "save-thread",
-					NULL, save_thread, dev);
+		vcos_status = vcos_thread_create(&dev->processlogo_thread, "processlogo-thread",
+					NULL, processlogo_thread, dev);
 		if(vcos_status != VCOS_SUCCESS)
 		{
 			print("Failed to create save thread\n");
@@ -2318,7 +2477,7 @@ static void destroy_mmal(struct device *dev)
 {
 	//FIXME: Clean up everything properly
 	dev->thread_quit = 1;
-	vcos_thread_join(&dev->save_thread, NULL);
+	vcos_thread_join(&dev->processlogo_thread, NULL);
 }
 
 static void video_save_image(struct device *dev, struct v4l2_buffer *buf,
@@ -2499,6 +2658,7 @@ static int video_do_capture(struct device *dev, unsigned int nframes,
 
 			clock_gettime(CLOCK_MONOTONIC, &ts);
 			get_ts_flags(buf.flags, &ts_type, &ts_source);
+			/*
 			print("%u (%u) [%c] %s %u %u B %ld.%06ld %ld.%06ld %.3f fps ts %s/%s\n", i, buf.index,
 				(buf.flags & V4L2_BUF_FLAG_ERROR) ? 'E' : '-',
 				v4l2_field_name(buf.field),
@@ -2506,7 +2666,7 @@ static int video_do_capture(struct device *dev, unsigned int nframes,
 				buf.timestamp.tv_sec, buf.timestamp.tv_usec,
 				ts.tv_sec, ts.tv_nsec/1000, fps,
 				ts_type, ts_source);
-
+			*/
 			last = buf.timestamp;
 
 			/* Save the image. */
@@ -2709,7 +2869,9 @@ static void usage(const char *argv0)
 	print("-d, --delay			Delay (in ms) before requeuing buffers\n");
 	print("-f, --format format		Set the video format\n");
 	print("				use -f help to list the supported formats\n");
-	print("-E, --encode-to [file]		Set filename to write to. Default of file.h264.\n");
+	print("-S, --save-to [file]		Set filename to write to. Default of frame.jpg.\n");
+  print("-L, --logos-dir [file]		Set Logos path. Default of logos\n");
+	print("-P, --pngview-dir [file]		Set pngview path. Default of pngview\n");
 	print("-F, --file[=name]		Read/write frames from/to disk\n");
 	print("\tFor video capture devices, the first '#' character in the file name is\n");
 	print("\texpanded to the frame sequence number. The default file name is\n");
@@ -2771,7 +2933,9 @@ static struct option opts[] = {
 	{"check-overrun", 0, 0, 'C'},
 	{"data-prefix", 0, 0, OPT_DATA_PREFIX},
 	{"delay", 1, 0, 'd'},
-	{"encode-to", 1, 0, 'E'},
+	{"save-to", 1, 0, 'S'},
+	{"logos-dir", 1, 0, 'L'},
+	{"pngview-dir", 1, 0, 'P'},
 	{"enum-formats", 0, 0, OPT_ENUM_FORMATS},
 	{"enum-inputs", 0, 0, OPT_ENUM_INPUTS},
 	{"fd", 1, 0, OPT_FD},
@@ -2824,7 +2988,7 @@ int main(int argc, char *argv[])
 	int do_sleep_forever = 0, do_requeue_last = 0;
 	int do_rt = 0, do_log_status = 0;
 	int no_query = 0, do_queue_late = 0;
-	int do_mmal_render = 0, do_encode = 0;
+	int do_mmal_render = 0, do_encode = 1;
 	int do_set_dv_timings = 0;
 	char *endptr;
 	int c;
@@ -2853,14 +3017,17 @@ int main(int argc, char *argv[])
 	enum buffer_fill_mode fill_mode = BUFFER_FILL_NONE;
 	unsigned int delay = 0, nframes = (unsigned int)-1;
 	const char *filename = "frame-#.bin";
-	const char *encode_filename = "file.h264";
+	const char *encode_filename = "frame.jpg";
+	const char *pngview_path = "pngview";
+	const char *logos_path = "logos";
 
 	unsigned int rt_priority = 1;
 
 	video_init(&dev);
-
+	
+	dev.save_encode = 0;
 	opterr = 0;
-	while ((c = getopt_long(argc, argv, "B:c::Cd:E:f:F::hi:Ilmn:pq:r:R::s:t:Tuw:", opts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "B:c::Cd:S:L:P:f:F::hi:Ilmn:pq:r:R::s:t:Tuw:", opts, NULL)) != -1) {
 
 		switch (c) {
 		case 'B':
@@ -2882,12 +3049,23 @@ int main(int argc, char *argv[])
 		case 'd':
 			delay = atoi(optarg);
 			break;
-		case 'E':
-			print("We're encoding to %s\n", optarg);
+		case 'S':
+			print("We're saving tv frame to %s\n", optarg);
 			do_encode = 1;
+			dev.save_encode = 1;
 			if (optarg)
 				encode_filename = optarg;
 			break;
+		case 'L':
+			print("We're looking for logos in %s\n", optarg);
+			if (optarg)
+				logos_path = optarg;
+			break;			
+		case 'P':
+			print("We're launching pngview from  %s\n", optarg);;
+			if (optarg)
+				pngview_path = optarg;
+			break;			
 		case 'f':
 			if (!strcmp("help", optarg)) {
 				list_formats();
@@ -3064,6 +3242,10 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	dev.save_filename = encode_filename;
+	dev.pngview_path = pngview_path;
+	dev.logos_path = logos_path;
+	
 	if ((fill_mode & BUFFER_FILL_PADDING) && memtype != V4L2_MEMORY_USERPTR) {
 		print("Buffer overrun can only be checked in USERPTR mode.\n");
 		return 1;
@@ -3164,7 +3346,7 @@ int main(int argc, char *argv[])
 		video_get_fps(&dev);
 
 	if (do_mmal_render) {
-		setup_mmal(&dev, nbufs, do_encode, encode_filename);
+		setup_mmal(&dev, nbufs, do_encode);
 	}
 
 	while (do_sleep_forever)
